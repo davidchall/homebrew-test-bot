@@ -104,6 +104,7 @@
 #:    `GIT_URL`: if set to URL of a tap remote, same as `--tap`
 
 require "formula"
+require "formula_installer"
 require "utils"
 require "date"
 require "rexml/document"
@@ -573,18 +574,9 @@ module Homebrew
     end
 
     def satisfied_requirements?(formula, spec, dependency = nil)
-      requirements = formula.send(spec).recursive_requirements
-
-      unsatisfied_requirements = requirements.reject do |requirement|
-        satisfied = false
-        satisfied ||= requirement.satisfied?
-        satisfied ||= requirement.optional?
-        if !satisfied && requirement.default_formula?
-          default = Formula[requirement.default_formula]
-          satisfied = satisfied_requirements?(default, :stable, formula.full_name)
-        end
-        satisfied
-      end
+      f = Formulary.factory(formula.full_name, spec)
+      fi = FormulaInstaller.new(f)
+      unsatisfied_requirements, = fi.expand_requirements
 
       if unsatisfied_requirements.empty?
         true
@@ -593,7 +585,7 @@ module Homebrew
         name += " (#{spec})" unless spec == :stable
         name += " (#{dependency} dependency)" if dependency
         skip name
-        puts unsatisfied_requirements.map(&:message)
+        puts unsatisfied_requirements.values.flatten.map(&:message)
         false
       end
     end
@@ -743,7 +735,17 @@ module Homebrew
         deps.each do |dep|
           CompilerSelector.select_for(dep.to_formula)
         end
-        CompilerSelector.select_for(formula)
+        if formula.devel && formula.stable? \
+           && !ARGV.include?("--HEAD") && !ARGV.include?("--fast")
+          CompilerSelector.select_for(formula)
+          CompilerSelector.select_for(formula.devel)
+        elsif ARGV.include?("--HEAD")
+          CompilerSelector.select_for(formula.head)
+        elsif formula.stable
+          CompilerSelector.select_for(formula)
+        elsif formula.devel
+          CompilerSelector.select_for(formula.devel)
+        end
       rescue CompilerSelectionError => e
         unless installed_gcc
           run_as_not_developer { test "brew", "install", "gcc" }
@@ -979,6 +981,7 @@ module Homebrew
       Tap.names.each do |tap|
         next if tap == "homebrew/core"
         next if tap.end_with?("/test-bot")
+        next if tap == "caskroom/cask"
         next if tap == @tap.to_s
         test "brew", "untap", tap
       end
@@ -1049,7 +1052,7 @@ module Homebrew
 
       if ENV["TRAVIS"]
         # For Travis CI build caching.
-        test "brew", "install", "md5deep", "libyaml" if OS.mac?
+        test "brew", "install", "md5deep", "libyaml", "gmp", "openssl" if OS.mac?
         return if @tap && @tap.repo.to_s != "test-bot"
       end
 
@@ -1097,7 +1100,18 @@ module Homebrew
       changed_formulae_dependents = {}
 
       @formulae.each do |formula|
-        formula_dependencies = Utils.popen_read("brew", "deps", "--full-name", "--include-build", formula).split("\n")
+        begin
+          formula_dependencies = Utils.popen_read("brew", "deps", "--full-name", "--include-build", formula).split("\n")
+          # deps can fail if deps are not tapped
+          unless $?.success?
+            Formulary.factory(formula).recursive_dependencies
+          end
+        rescue TapFormulaUnavailableError => e
+          raise if e.tap.installed?
+          e.tap.clear_cache
+          safe_system "brew", "tap", e.tap.name
+          retry
+        end
         unchanged_dependencies = formula_dependencies - @formulae
         changed_dependences = formula_dependencies - unchanged_dependencies
         changed_dependences.each do |changed_formula|
@@ -1212,10 +1226,13 @@ module Homebrew
     end
 
     first_formula_name = bottles_hash.keys.first
-    tap = Tap.fetch(first_formula_name.rpartition("/").first.chuzzle || "homebrew/core")
+    tap ||= Tap.fetch(first_formula_name.rpartition("/").first.chuzzle || "homebrew/core")
+    ENV["HOMEBREW_GIT_NAME"] = ARGV.value("git-name") || "BrewTestBot"
+    ENV["HOMEBREW_GIT_EMAIL"] = ARGV.value("git-email") ||
+                                "brew-test-bot@googlegroups.com"
 
     if ARGV.include?("--dry-run")
-      puts <<-EOS.undent
+      puts <<~EOS
         git -C #{tap.path} am --abort
         git -C #{tap.path} rebase --abort
         git -C #{tap.path} checkout -f master
@@ -1249,6 +1266,10 @@ module Homebrew
 
     # These variables are for Jenkins, Circle CI, and Travis CI respectively.
     upstream_number = ENV["UPSTREAM_BUILD_NUMBER"] || ENV["CIRCLE_BUILD_NUM"] || ENV["TRAVIS_BUILD_NUMBER"]
+    # If the GITHUB_TOKEN variable is set, use token+https instead of ssh for pushing.
+    # Note that we do not use 'tap.user' but instead GIT_AUTHOR_NAME. This is because
+    # we may push to a different place than the 'tap.user' repo. For example,
+    # for Homebrew-core, tap.user=Homebrew but GIT_AUTHOR_NAME=BrewTestBot.
     remote = if github_token
       "https://#{github_token}@github.com/#{ENV["GIT_AUTHOR_NAME"]}/homebrew-#{tap.repo}.git"
     else
@@ -1281,7 +1302,7 @@ module Homebrew
       bintray_repo = bottle_hash["bintray"]["repository"]
       bintray_packages_url = "https://api.bintray.com/packages/#{bintray_org}/#{bintray_repo}"
 
-      bottle_hash["bottle"]["tags"].each do |_tag, tag_hash|
+      bottle_hash["bottle"]["tags"].each_value do |tag_hash|
         filename = tag_hash["filename"]
         bintray_filename_url = "#{root_url}/#{filename}"
         filename_already_published = if ARGV.include?("--dry-run")
@@ -1294,7 +1315,7 @@ module Homebrew
         end
 
         if filename_already_published
-          raise <<-EOS.undent
+          raise <<~EOS
             #{filename} is already published. Please remove it manually from
             https://bintray.com/#{bintray_org}/#{bintray_repo}/#{bintray_package}/view#files
           EOS
@@ -1310,7 +1331,7 @@ module Homebrew
           end
 
           unless package_exists
-            package_blob = <<-EOS.undent
+            package_blob = <<~EOS
               {"name": "#{bintray_package}",
                "public_download_numbers": true,
                "public_stats": true,
@@ -1318,8 +1339,8 @@ module Homebrew
                "vcs_url": "https://github.com/#{tap.user}/homebrew-#{tap.repo}.git"}
             EOS
             if ARGV.include?("--dry-run")
-              puts <<-EOS.undent
-                curl --user $BINTRAY_USER:$BINTRAY_KEY
+              puts <<~EOS
+                curl --user $HOMEBREW_BINTRAY_USER:$HOMEBREW_BINTRAY_KEY
                      --header Content-Type: application/json
                      --data #{package_blob.delete("\n")}
                      #{bintray_packages_url}
@@ -1337,8 +1358,8 @@ module Homebrew
         content_url = "https://api.bintray.com/content/#{bintray_org}"
         content_url += "/#{bintray_repo}/#{filename}"
         if ARGV.include?("--dry-run")
-          puts <<-EOS.undent
-            curl --user $BINTRAY_USER:$BINTRAY_KEY
+          puts <<~EOS
+            curl --user $HOMEBREW_BINTRAY_USER:$HOMEBREW_BINTRAY_KEY
                  --header X-Bintray-Package:#{bintray_package}
                  --header X-Bintray-Version:#{version}
                  --header X-Bintray-Publish:1
@@ -1374,16 +1395,11 @@ module Homebrew
 
     ENV["HOMEBREW_DEVELOPER"] = "1"
     ENV["HOMEBREW_SANDBOX"] = "1"
+    ENV["HOMEBREW_ENV_FILTERING"] = "1"
     ENV["HOMEBREW_NO_AUTO_UPDATE"] = "1"
     ENV["HOMEBREW_NO_EMOJI"] = "1"
     ENV["HOMEBREW_FAIL_LOG_LINES"] = "150"
     ENV["PATH"] = "#{HOMEBREW_PREFIX}/bin:#{HOMEBREW_PREFIX}/sbin:#{ENV["PATH"]}"
-    ENV["GIT_AUTHOR_NAME"] =
-      ENV["GIT_COMMITTER_NAME"] =
-        ARGV.value("git-name") || "BrewTestBot"
-    ENV["GIT_AUTHOR_EMAIL"] =
-      ENV["GIT_COMMITTER_EMAIL"] =
-        ARGV.value("git-email") || "brew-test-bot@googlegroups.com"
 
     travis = !ENV["TRAVIS"].nil?
     if travis
